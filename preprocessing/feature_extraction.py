@@ -1,5 +1,7 @@
 """Feature extraction for occlusion-robust TLS stem detection.
 
+Author: Shahab Alaedin Baloochi
+
 Implements Sections 2.2.1--2.2.4 of the manuscript:
     1. relative height
     2. radial distance to tree centre
