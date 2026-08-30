@@ -2,48 +2,13 @@
 
 Author: Shahab Alaedin Baloochi
 
-Implements the connected subgraph processing described in Section 2.4 of the
-manuscript. Subgraphs are expanded with breadth-first search (BFS) on the
-precomputed fixed Euclidean k-NN graph; the graph is never recomputed in
-feature space.
-
-Two modes are provided:
-
-1. Training sampling
-   - sample a seed from a height stratum (lower / middle / crown),
-   - expand by BFS on the fixed graph,
-   - return a connected subgraph of 8,192 points whenever the seed's connected
-     component contains at least 8,192 points.
-
-2. Exhaustive inference partitioning
-   - partition each fixed-graph connected component through a deterministic
-     breadth-first spanning tree,
-   - cut connectivity-preserving tree subgraphs with at most 8,192 points,
-   - subgraphs do not overlap and every tree point is covered exactly once,
-   - graph edges crossing subgraph boundaries are omitted locally, as stated
-     in the manuscript.
-
-Reproducibility notes
----------------------
-The manuscript specifies height-stratified training seeds but does not provide
-numerical cut-points for lower/middle/crown. This implementation therefore
-makes the cut-points explicit and configurable through ``stratum_edges``. The
-default is three equal relative-height intervals (0, 1/3, 2/3, 1), consistent
-with the paper's separate evaluation protocol that reports lower/middle/upper
-recall in three equal relative-height bins. If the original experiment used
-different training cut-points, pass them explicitly.
-
-The manuscript also states that inference proceeds sequentially through
-non-overlapping connected subgraphs but does not prescribe an exact inference
-seed/partition rule. A naive repeated BFS carve can fragment the unassigned
-remainder into many tiny pieces. To avoid that artefact while preserving every
-explicit manuscript constraint, inference here first builds a breadth-first
-spanning tree inside each connected component and removes the largest active
-spanning-tree subtree that fits within the 8,192-point budget. Removing a tree
-subtree leaves the remainder connected in the spanning tree, so artificial
-one-point residuals are avoided. The root is chosen deterministically as the
-highest-Z point of each original connected component (ties: smallest point ID).
-No graph edge is added or recomputed; only the batching partition is defined.
+Training follows Section 2.4 of the manuscript: a height-stratified seed is
+expanded by BFS on the precomputed fixed Euclidean k-NN graph to obtain an
+8,192-point connected subgraph. Inference uses the same fixed graph and covers
+every point exactly once with connected, non-overlapping blocks. The manuscript
+does not specify the exact inference partition rule, so a deterministic
+connectivity-preserving tree partition is used here to avoid tiny residual
+fragments. No graph edge is added or recomputed.
 """
 
 from __future__ import annotations
@@ -56,7 +21,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import breadth_first_order, connected_components
+from scipy.sparse.csgraph import connected_components, depth_first_order
 
 DEFAULT_SUBGRAPH_SIZE = 8192
 DEFAULT_STRATUM_EDGES = (0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0)
@@ -65,8 +30,6 @@ STRATUM_NAMES = ("lower", "middle", "crown")
 
 @dataclass
 class SampledSubgraph:
-    """A connected subgraph with original global point IDs and local edges."""
-
     point_ids: np.ndarray
     edge_index: np.ndarray
     seed_id: int
@@ -83,8 +46,6 @@ class SampledSubgraph:
 
 @dataclass
 class InferencePartition:
-    """Non-overlapping exhaustive inference subgraphs for one complete tree."""
-
     subgraphs: list[SampledSubgraph]
     num_points: int
     target_size: int
@@ -100,10 +61,8 @@ class InferencePartition:
 
 def _validate_points(points: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError(f"points must have shape (N, 3), got {points.shape}.")
-    if points.shape[0] == 0:
-        raise ValueError("points must be non-empty.")
+    if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
+        raise ValueError(f"points must have shape (N, 3) with N>0, got {points.shape}.")
     if not np.isfinite(points).all():
         raise ValueError("points contains NaN or infinite coordinates.")
     return points
@@ -113,28 +72,22 @@ def _validate_edge_index(edge_index: np.ndarray, num_nodes: int) -> np.ndarray:
     edge_index = np.asarray(edge_index, dtype=np.int64)
     if edge_index.ndim != 2 or edge_index.shape[0] != 2:
         raise ValueError(f"edge_index must have shape (2, E), got {edge_index.shape}.")
-    if num_nodes <= 0:
-        raise ValueError("num_nodes must be positive.")
-    if edge_index.size and (np.any(edge_index < 0) or np.any(edge_index >= num_nodes)):
-        raise ValueError("edge_index contains an out-of-range node index.")
-    if edge_index.size and np.any(edge_index[0] == edge_index[1]):
-        raise ValueError("edge_index contains a self-edge.")
+    if edge_index.size and (
+        np.any(edge_index < 0)
+        or np.any(edge_index >= num_nodes)
+        or np.any(edge_index[0] == edge_index[1])
+    ):
+        raise ValueError("edge_index contains an invalid node index or self-edge.")
     return edge_index
 
 
 def build_csr_adjacency(edge_index: np.ndarray, num_nodes: int) -> csr_matrix:
-    """Build a binary CSR adjacency from the precomputed fixed graph."""
     edge_index = _validate_edge_index(edge_index, num_nodes)
     if edge_index.shape[1] == 0:
         return csr_matrix((num_nodes, num_nodes), dtype=np.uint8)
-
     adjacency = csr_matrix(
-        (
-            np.ones(edge_index.shape[1], dtype=np.uint8),
-            (edge_index[0], edge_index[1]),
-        ),
+        (np.ones(edge_index.shape[1], dtype=np.uint8), (edge_index[0], edge_index[1])),
         shape=(num_nodes, num_nodes),
-        dtype=np.uint8,
     )
     adjacency.data[:] = 1
     adjacency.eliminate_zeros()
@@ -143,37 +96,25 @@ def build_csr_adjacency(edge_index: np.ndarray, num_nodes: int) -> csr_matrix:
 
 
 def compute_relative_height(points: np.ndarray) -> np.ndarray:
-    """Return per-point relative tree height in [0, 1]."""
     points = _validate_points(points)
     z = points[:, 2]
-    z_min = float(z.min())
-    height = float(z.max() - z_min)
-    if height <= 1e-12:
-        return np.zeros(points.shape[0], dtype=np.float64)
-    return (z - z_min) / (height + 1e-12)
+    h = float(z.max() - z.min())
+    return np.zeros(len(points)) if h <= 1e-12 else (z - z.min()) / (h + 1e-12)
 
 
 def assign_height_strata(
     relative_height: np.ndarray,
     stratum_edges: Sequence[float] = DEFAULT_STRATUM_EDGES,
 ) -> np.ndarray:
-    """Assign lower/middle/crown integer labels 0, 1, 2."""
     relative_height = np.asarray(relative_height, dtype=np.float64)
-    if relative_height.ndim != 1:
-        raise ValueError("relative_height must be one-dimensional.")
-    if not np.isfinite(relative_height).all():
-        raise ValueError("relative_height contains NaN or infinite values.")
-
     edges = np.asarray(stratum_edges, dtype=np.float64)
-    if edges.shape != (4,):
-        raise ValueError("stratum_edges must contain exactly four boundaries.")
-    if not np.all(np.diff(edges) > 0):
-        raise ValueError("stratum_edges must be strictly increasing.")
+    if relative_height.ndim != 1 or not np.isfinite(relative_height).all():
+        raise ValueError("relative_height must be a finite 1D array.")
+    if edges.shape != (4,) or not np.all(np.diff(edges) > 0):
+        raise ValueError("stratum_edges must contain four strictly increasing values.")
     if edges[0] > 0.0 or edges[-1] < 1.0:
-        raise ValueError("stratum_edges must cover the full [0,1] interval.")
-
-    labels = np.digitize(relative_height, edges[1:-1], right=False)
-    return np.clip(labels, 0, 2).astype(np.int8, copy=False)
+        raise ValueError("stratum_edges must cover [0,1].")
+    return np.clip(np.digitize(relative_height, edges[1:-1]), 0, 2).astype(np.int8)
 
 
 def _bfs_collect(
@@ -182,76 +123,42 @@ def _bfs_collect(
     max_nodes: int,
     allowed_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Collect up to ``max_nodes`` by BFS while preserving connectivity."""
     n = adjacency.shape[0]
-    if not (0 <= seed_id < n):
-        raise ValueError(f"seed_id={seed_id} is outside [0,{n}).")
-    if max_nodes <= 0:
-        raise ValueError("max_nodes must be positive.")
-
-    if allowed_mask is None:
-        allowed = np.ones(n, dtype=bool)
-    else:
-        allowed = np.asarray(allowed_mask, dtype=bool)
-        if allowed.shape != (n,):
-            raise ValueError("allowed_mask must have shape (N,).")
-    if not allowed[seed_id]:
-        raise ValueError("The BFS seed is not available in allowed_mask.")
+    if not (0 <= seed_id < n) or max_nodes <= 0:
+        raise ValueError("Invalid BFS seed or max_nodes.")
+    allowed = np.ones(n, dtype=bool) if allowed_mask is None else np.asarray(allowed_mask, dtype=bool)
+    if allowed.shape != (n,) or not allowed[seed_id]:
+        raise ValueError("Invalid allowed_mask for BFS.")
 
     seen = np.zeros(n, dtype=bool)
     seen[seed_id] = True
     queue: deque[int] = deque([int(seed_id)])
     selected: list[int] = []
-    indptr = adjacency.indptr
-    indices = adjacency.indices
-
     while queue and len(selected) < max_nodes:
         node = queue.popleft()
         selected.append(node)
-        if len(selected) == max_nodes:
-            break
-
-        start, stop = indptr[node], indptr[node + 1]
-        for neighbour in indices[start:stop]:
-            neighbour = int(neighbour)
-            if allowed[neighbour] and not seen[neighbour]:
-                seen[neighbour] = True
-                queue.append(neighbour)
-
+        for nb in adjacency.indices[adjacency.indptr[node] : adjacency.indptr[node + 1]]:
+            nb = int(nb)
+            if allowed[nb] and not seen[nb]:
+                seen[nb] = True
+                queue.append(nb)
     return np.asarray(selected, dtype=np.int64)
 
 
 def induce_local_edge_index(adjacency: csr_matrix, point_ids: np.ndarray) -> np.ndarray:
-    """Extract the fixed global edges internal to one subgraph and remap locally.
-
-    This is an induced subgraph of the precomputed global graph. Neighbourhoods
-    are not recomputed; boundary-crossing edges are omitted.
-    """
     point_ids = np.asarray(point_ids, dtype=np.int64)
     n = adjacency.shape[0]
     if point_ids.ndim != 1 or point_ids.size == 0:
-        raise ValueError("point_ids must be a non-empty one-dimensional array.")
-    if np.any(point_ids < 0) or np.any(point_ids >= n):
-        raise ValueError("point_ids contains an out-of-range global index.")
-    if np.unique(point_ids).size != point_ids.size:
-        raise ValueError("point_ids contains duplicate nodes.")
-
-    # Sparse slicing preserves only edges whose endpoints are both in point_ids
-    # and automatically maps them to local row/column indices 0..m-1.
-    local_csr = adjacency[point_ids][:, point_ids].tocsr()
-    local_csr.sort_indices()
-    rows, cols = local_csr.nonzero()
+        raise ValueError("point_ids must be a non-empty 1D array.")
+    if np.any(point_ids < 0) or np.any(point_ids >= n) or np.unique(point_ids).size != point_ids.size:
+        raise ValueError("point_ids contains invalid or duplicate indices.")
+    local = adjacency[point_ids][:, point_ids].tocsr()
+    local.sort_indices()
+    rows, cols = local.nonzero()
     return np.vstack((rows, cols)).astype(np.int64, copy=False)
 
 
 class ConnectedSubgraphSampler:
-    """Reusable sampler that preprocesses graph metadata once per tree.
-
-    The adjacency, connected components, relative heights and height strata are
-    computed once and reused across many training samples. This avoids rebuilding
-    the full graph structures for every mini-batch.
-    """
-
     def __init__(
         self,
         points: np.ndarray,
@@ -260,34 +167,22 @@ class ConnectedSubgraphSampler:
         stratum_edges: Sequence[float] = DEFAULT_STRATUM_EDGES,
     ) -> None:
         self.points = _validate_points(points)
-        self.num_nodes = int(self.points.shape[0])
-        self.global_edge_index = _validate_edge_index(global_edge_index, self.num_nodes)
+        self.num_nodes = len(self.points)
         if target_size <= 0:
             raise ValueError("target_size must be positive.")
         self.target_size = int(target_size)
-        self.stratum_edges = tuple(float(x) for x in stratum_edges)
-
+        self.global_edge_index = _validate_edge_index(global_edge_index, self.num_nodes)
         self.adjacency = build_csr_adjacency(self.global_edge_index, self.num_nodes)
-        # Section 2.2.2 treats the symmetrised k-NN graph as undirected.
-        # Refuse an asymmetric input rather than silently changing graph semantics.
-        if (self.adjacency != self.adjacency.T).nnz != 0:
-            raise ValueError(
-                "global_edge_index is not symmetric; pass the symmetrised fixed k-NN graph."
-            )
+        if (self.adjacency != self.adjacency.T).nnz:
+            raise ValueError("global_edge_index must be the symmetrised fixed graph.")
 
-        n_components, component_labels = connected_components(
-            self.adjacency, directed=False
-        )
+        n_components, labels = connected_components(self.adjacency, directed=False)
         self.num_components = int(n_components)
-        self.component_labels = component_labels.astype(np.int64, copy=False)
-        self.component_sizes = np.bincount(
-            self.component_labels, minlength=self.num_components
-        ).astype(np.int64, copy=False)
-
+        self.component_labels = labels.astype(np.int64, copy=False)
+        self.component_sizes = np.bincount(labels, minlength=n_components).astype(np.int64)
+        self.stratum_edges = tuple(float(x) for x in stratum_edges)
         self.relative_height = compute_relative_height(self.points)
-        self.height_strata = assign_height_strata(
-            self.relative_height, stratum_edges=self.stratum_edges
-        )
+        self.height_strata = assign_height_strata(self.relative_height, self.stratum_edges)
 
     def sample_training(
         self,
@@ -295,275 +190,134 @@ class ConnectedSubgraphSampler:
         requested_stratum: Optional[int | str] = None,
         require_full_size: bool = True,
     ) -> SampledSubgraph:
-        """Sample one height-stratified connected training subgraph."""
-        if rng is None:
-            rng = np.random.default_rng()
-
+        rng = np.random.default_rng() if rng is None else rng
         if requested_stratum is None:
-            stratum_id = int(rng.integers(0, 3))
+            sid = int(rng.integers(0, 3))
         elif isinstance(requested_stratum, str):
             if requested_stratum not in STRATUM_NAMES:
-                raise ValueError(f"Unknown stratum '{requested_stratum}'.")
-            stratum_id = STRATUM_NAMES.index(requested_stratum)
+                raise ValueError(f"Unknown stratum: {requested_stratum}")
+            sid = STRATUM_NAMES.index(requested_stratum)
         else:
-            stratum_id = int(requested_stratum)
-            if stratum_id not in (0, 1, 2):
-                raise ValueError("requested_stratum must be 0, 1, 2 or a stratum name.")
+            sid = int(requested_stratum)
+            if sid not in (0, 1, 2):
+                raise ValueError("requested_stratum must be 0, 1, 2, or a stratum name.")
 
-        if require_full_size:
-            viable = self.component_sizes[self.component_labels] >= self.target_size
-        else:
-            viable = np.ones(self.num_nodes, dtype=bool)
-
-        candidates = np.flatnonzero((self.height_strata == stratum_id) & viable)
+        viable = (
+            self.component_sizes[self.component_labels] >= self.target_size
+            if require_full_size
+            else np.ones(self.num_nodes, dtype=bool)
+        )
+        candidates = np.flatnonzero((self.height_strata == sid) & viable)
         if candidates.size == 0:
-            raise RuntimeError(
-                f"No viable seed exists in stratum '{STRATUM_NAMES[stratum_id]}' "
-                f"for target_size={self.target_size}."
-            )
-
-        seed_id = int(rng.choice(candidates))
-        point_ids = _bfs_collect(
-            self.adjacency,
-            seed_id=seed_id,
-            max_nodes=self.target_size,
-        )
-        if require_full_size and point_ids.size != self.target_size:
-            raise RuntimeError(
-                f"BFS returned {point_ids.size} points; expected {self.target_size}."
-            )
-
-        return SampledSubgraph(
-            point_ids=point_ids,
-            edge_index=induce_local_edge_index(self.adjacency, point_ids),
-            seed_id=seed_id,
-            stratum=STRATUM_NAMES[stratum_id],
-        )
+            raise RuntimeError(f"No viable seed in stratum '{STRATUM_NAMES[sid]}'.")
+        seed = int(rng.choice(candidates))
+        ids = _bfs_collect(self.adjacency, seed, self.target_size)
+        if require_full_size and ids.size != self.target_size:
+            raise RuntimeError("BFS did not reach the requested training size.")
+        return SampledSubgraph(ids, induce_local_edge_index(self.adjacency, ids), seed, STRATUM_NAMES[sid])
 
     def _select_inference_root(self, component_nodes: np.ndarray) -> int:
-        """Choose a deterministic root for one original graph component.
+        xyz = self.points[component_nodes]
+        centre = np.median(xyz, axis=0)
+        d2 = np.einsum("ij,ij->i", xyz - centre, xyz - centre)
+        candidates = component_nodes[np.flatnonzero(d2 == d2.min())]
+        return int(candidates.min())
 
-        The manuscript does not specify the inference seed rule. We use the
-        highest-Z point and break exact-height ties by the smallest original
-        point ID. This choice affects batching boundaries only.
-        """
-        component_nodes = np.asarray(component_nodes, dtype=np.int64)
-        z = self.points[component_nodes, 2]
-        z_max = float(z.max())
-        tied = component_nodes[np.flatnonzero(z == z_max)]
-        return int(tied.min())
-
-    def _partition_component_connectivity_preserving(
-        self,
-        component_nodes: np.ndarray,
-    ) -> list[SampledSubgraph]:
-        """Partition one original component without fragmenting its remainder.
-
-        A breadth-first spanning tree is constructed from the fixed graph. At
-        each step, the largest currently active spanning-tree subtree that fits
-        within ``target_size`` is cut off. A tree subtree is connected, and its
-        removal leaves the remaining tree connected. Therefore the procedure
-        avoids the large number of tiny residual components produced by naive
-        repeated BFS carving.
-        """
-        component_nodes = np.asarray(component_nodes, dtype=np.int64)
-        if component_nodes.ndim != 1 or component_nodes.size == 0:
-            raise ValueError("component_nodes must be a non-empty 1D array.")
-
-        component_nodes = np.sort(component_nodes)
-        n_component = int(component_nodes.size)
-        component_adjacency = self.adjacency[component_nodes][:, component_nodes].tocsr()
-        component_adjacency.sort_indices()
-
+    def _partition_component(self, component_nodes: np.ndarray) -> list[SampledSubgraph]:
+        component_nodes = np.sort(np.asarray(component_nodes, dtype=np.int64))
+        n = component_nodes.size
+        local_adj = self.adjacency[component_nodes][:, component_nodes].tocsr()
+        local_adj.sort_indices()
         root_global = self._select_inference_root(component_nodes)
-        root_local = int(np.searchsorted(component_nodes, root_global))
-        if n_component <= self.target_size:
-            bfs_local = _bfs_collect(
-                component_adjacency,
-                seed_id=root_local,
-                max_nodes=n_component,
-            )
-            if bfs_local.size != n_component:
-                raise RuntimeError("Small inference component is not BFS-connected.")
-            bfs_global = component_nodes[bfs_local]
-            return [
-                SampledSubgraph(
-                    point_ids=bfs_global,
-                    edge_index=induce_local_edge_index(self.adjacency, bfs_global),
-                    seed_id=root_global,
-                    stratum=None,
-                )
-            ]
+        root = int(np.searchsorted(component_nodes, root_global))
 
-        if component_nodes[root_local] != root_global:
-            raise RuntimeError("Could not map inference root to component-local index.")
+        if n <= self.target_size:
+            local_ids = _bfs_collect(local_adj, root, n)
+            global_ids = component_nodes[local_ids]
+            return [SampledSubgraph(global_ids, induce_local_edge_index(self.adjacency, global_ids), root_global)]
 
-        bfs_order, predecessors = breadth_first_order(
-            component_adjacency,
-            i_start=root_local,
-            directed=False,
-            return_predecessors=True,
-        )
-        bfs_order = np.asarray(bfs_order, dtype=np.int64)
-        predecessors = np.asarray(predecessors, dtype=np.int64)
-        if bfs_order.size != n_component:
-            raise RuntimeError("BFS spanning tree did not cover the complete component.")
+        order, pred = depth_first_order(local_adj, i_start=root, directed=False, return_predecessors=True)
+        order = np.asarray(order, dtype=np.int64)
+        parent = np.asarray(pred, dtype=np.int64)
+        if order.size != n:
+            raise RuntimeError("Spanning tree did not cover the component.")
+        parent[root] = -1
 
-        parent = predecessors.copy()
-        parent[root_local] = -1
-
-        child_ids = np.flatnonzero(parent >= 0).astype(np.int64, copy=False)
-        parent_ids = parent[child_ids]
+        child_ids = np.flatnonzero(parent >= 0).astype(np.int64)
         tree_children = csr_matrix(
-            (
-                np.ones(child_ids.size, dtype=np.uint8),
-                (parent_ids, child_ids),
-            ),
-            shape=(n_component, n_component),
-            dtype=np.uint8,
+            (np.ones(child_ids.size, dtype=np.uint8), (parent[child_ids], child_ids)),
+            shape=(n, n),
         )
         tree_children.sort_indices()
+        subtree_size = np.ones(n, dtype=np.int64)
+        for node in order[::-1]:
+            if parent[node] >= 0:
+                subtree_size[parent[node]] += subtree_size[node]
 
-        # Initial BFS-tree subtree sizes.
-        subtree_size = np.ones(n_component, dtype=np.int64)
-        for node in bfs_order[::-1]:
-            p = parent[node]
-            if p >= 0:
-                subtree_size[p] += subtree_size[node]
-
-        active = np.ones(n_component, dtype=bool)
-        remaining = n_component
-        chunks_local: list[tuple[np.ndarray, int]] = []
-
-        child_indptr = tree_children.indptr
-        children = tree_children.indices
-
+        active = np.ones(n, dtype=bool)
+        remaining = int(n)
+        chunks: list[tuple[np.ndarray, int]] = []
         while remaining > self.target_size:
-            candidates = np.flatnonzero(
-                active
-                & (subtree_size > 0)
-                & (subtree_size <= self.target_size)
-            )
+            candidates = np.flatnonzero(active & (subtree_size > 0) & (subtree_size <= self.target_size))
             if candidates.size == 0:
-                raise RuntimeError(
-                    "No connectivity-preserving inference cut fits the target size."
-                )
-
-            candidate_sizes = subtree_size[candidates]
-            best_size = int(candidate_sizes.max())
-            best_candidates = candidates[candidate_sizes == best_size]
-            # Deterministic tie break in original point-ID space.
-            cut_root = int(
-                best_candidates[
-                    np.argmin(component_nodes[best_candidates])
-                ]
-            )
+                raise RuntimeError("No valid connectivity-preserving cut found.")
+            sizes = subtree_size[candidates]
+            best = candidates[sizes == sizes.max()]
+            cut_root = int(best[np.argmin(component_nodes[best])])
 
             stack = [cut_root]
-            selected_list: list[int] = []
+            selected: list[int] = []
             while stack:
                 node = int(stack.pop())
                 if not active[node]:
                     continue
-                selected_list.append(node)
-                start, stop = child_indptr[node], child_indptr[node + 1]
-                for child in children[start:stop]:
-                    child = int(child)
-                    if active[child]:
-                        stack.append(child)
+                selected.append(node)
+                a, b = tree_children.indptr[node], tree_children.indptr[node + 1]
+                stack.extend(int(c) for c in tree_children.indices[a:b] if active[c])
+            selected_arr = np.asarray(selected, dtype=np.int64)
+            if selected_arr.size != int(subtree_size[cut_root]):
+                raise RuntimeError("Subtree-size bookkeeping mismatch.")
 
-            selected = np.asarray(selected_list, dtype=np.int64)
-            expected_size = int(subtree_size[cut_root])
-            if selected.size != expected_size:
-                raise RuntimeError(
-                    "Internal spanning-tree subtree-size bookkeeping is inconsistent."
-                )
-
-            active[selected] = False
-            subtree_size[selected] = 0
-            remaining -= int(selected.size)
-            chunks_local.append((selected, cut_root))
-
-            # Only ancestors of the cut root change their active subtree size.
+            removed = int(selected_arr.size)
+            active[selected_arr] = False
+            subtree_size[selected_arr] = 0
+            remaining -= removed
+            chunks.append((selected_arr, cut_root))
             ancestor = int(parent[cut_root])
             while ancestor >= 0:
-                subtree_size[ancestor] -= int(selected.size)
+                subtree_size[ancestor] -= removed
                 ancestor = int(parent[ancestor])
 
-        residual = np.flatnonzero(active).astype(np.int64, copy=False)
+        residual = np.flatnonzero(active).astype(np.int64)
         if residual.size == 0 or residual.size > self.target_size:
-            raise RuntimeError("Invalid residual size after inference partitioning.")
-        chunks_local.append((residual, root_local))
+            raise RuntimeError("Invalid final inference residual.")
+        chunks.append((residual, root))
 
-        subgraphs: list[SampledSubgraph] = []
-        for selected_local, seed_local in chunks_local:
-            selected_global = component_nodes[selected_local]
-            seed_global = int(component_nodes[seed_local])
-
-            # Reorder each chosen connected block by an actual BFS expansion on
-            # the fixed graph restricted to that block. Membership is unchanged.
-            allowed_local = np.zeros(n_component, dtype=bool)
-            allowed_local[selected_local] = True
-            bfs_selected_local = _bfs_collect(
-                component_adjacency,
-                seed_id=seed_local,
-                max_nodes=int(selected_local.size),
-                allowed_mask=allowed_local,
-            )
-            if bfs_selected_local.size != selected_local.size:
-                raise RuntimeError("Final inference block is not BFS-connected.")
-            bfs_selected_global = component_nodes[bfs_selected_local]
-
-            if not np.array_equal(
-                np.sort(bfs_selected_global),
-                np.sort(selected_global),
-            ):
-                raise RuntimeError("BFS reordering changed inference block membership.")
-
-            subgraphs.append(
+        output: list[SampledSubgraph] = []
+        for selected, seed_local in chunks:
+            allowed = np.zeros(n, dtype=bool)
+            allowed[selected] = True
+            bfs_ids = _bfs_collect(local_adj, seed_local, selected.size, allowed)
+            if bfs_ids.size != selected.size or not np.array_equal(np.sort(bfs_ids), np.sort(selected)):
+                raise RuntimeError("Inference block is not connected.")
+            global_ids = component_nodes[bfs_ids]
+            output.append(
                 SampledSubgraph(
-                    point_ids=bfs_selected_global,
-                    edge_index=induce_local_edge_index(
-                        self.adjacency,
-                        bfs_selected_global,
-                    ),
-                    seed_id=seed_global,
-                    stratum=None,
+                    global_ids,
+                    induce_local_edge_index(self.adjacency, global_ids),
+                    int(component_nodes[seed_local]),
                 )
             )
-
-        return subgraphs
+        return output
 
     def partition_inference(self) -> InferencePartition:
-        """Cover every point exactly once with connected, non-overlapping blocks.
-
-        Each original fixed-graph connected component is handled independently.
-        Within a component, a BFS spanning tree defines connectivity-preserving
-        cuts, preventing the severe remainder fragmentation caused by naive BFS
-        carving. Every final block is then explicitly BFS-ordered on the fixed
-        graph, and no boundary-crossing edge is included in its local edge set.
-        """
         subgraphs: list[SampledSubgraph] = []
-
-        for component_id in range(self.num_components):
-            component_nodes = np.flatnonzero(
-                self.component_labels == component_id
-            ).astype(np.int64, copy=False)
-            if component_nodes.size == 0:
-                continue
-            subgraphs.extend(
-                self._partition_component_connectivity_preserving(component_nodes)
-            )
-
-        # Deterministic full-tree ordering: process blocks by minimum original
-        # point ID. This ordering does not alter memberships or predictions.
-        subgraphs.sort(key=lambda sg: int(sg.point_ids.min()))
-
-        return InferencePartition(
-            subgraphs=subgraphs,
-            num_points=self.num_nodes,
-            target_size=self.target_size,
-        )
+        for cid in range(self.num_components):
+            nodes = np.flatnonzero(self.component_labels == cid).astype(np.int64)
+            if nodes.size:
+                subgraphs.extend(self._partition_component(nodes))
+        subgraphs.sort(key=lambda s: int(s.point_ids.min()))
+        return InferencePartition(subgraphs, self.num_nodes, self.target_size)
 
 
 def _is_connected_local(subgraph: SampledSubgraph) -> bool:
@@ -571,14 +325,11 @@ def _is_connected_local(subgraph: SampledSubgraph) -> bool:
         return True
     if subgraph.edge_index.shape[1] == 0:
         return False
-    adjacency = csr_matrix(
-        (
-            np.ones(subgraph.edge_index.shape[1], dtype=np.uint8),
-            (subgraph.edge_index[0], subgraph.edge_index[1]),
-        ),
+    adj = csr_matrix(
+        (np.ones(subgraph.edge_index.shape[1], dtype=np.uint8), (subgraph.edge_index[0], subgraph.edge_index[1])),
         shape=(subgraph.num_nodes, subgraph.num_nodes),
     )
-    n_components, _ = connected_components(adjacency, directed=False)
+    n_components, _ = connected_components(adj, directed=False)
     return int(n_components) == 1
 
 
@@ -587,36 +338,28 @@ def validate_sampled_subgraph(
     subgraph: SampledSubgraph,
     require_full_size: bool = False,
 ) -> dict[str, int | bool]:
-    """Validate connectivity, IDs, size and exact induced-edge mapping."""
     ids = np.asarray(subgraph.point_ids, dtype=np.int64)
     local = np.asarray(subgraph.edge_index, dtype=np.int64)
-
     expected = induce_local_edge_index(sampler.adjacency, ids)
     checks: dict[str, int | bool] = {
-        "nonempty": bool(ids.size > 0),
+        "nonempty": bool(ids.size),
         "size_within_limit": bool(ids.size <= sampler.target_size),
         "full_size": bool(ids.size == sampler.target_size),
         "unique_point_ids": bool(np.unique(ids).size == ids.size),
         "valid_global_ids": bool(np.all((ids >= 0) & (ids < sampler.num_nodes))),
-        "local_edge_shape_ok": bool(local.ndim == 2 and local.shape[0] == 2),
-        "valid_local_edges": bool(
-            local.size == 0 or np.all((local >= 0) & (local < ids.size))
-        ),
+        "valid_local_edges": bool(local.size == 0 or np.all((local >= 0) & (local < ids.size))),
         "self_edges": int(np.sum(local[0] == local[1])) if local.size else 0,
         "connected": bool(_is_connected_local(subgraph)),
         "induced_edge_mapping_exact": bool(np.array_equal(local, expected)),
+        "seed_inside_subgraph": bool(np.any(ids == subgraph.seed_id)),
     }
-    ok = (
-        checks["nonempty"]
-        and checks["size_within_limit"]
-        and checks["unique_point_ids"]
-        and checks["valid_global_ids"]
-        and checks["local_edge_shape_ok"]
-        and checks["valid_local_edges"]
-        and checks["self_edges"] == 0
-        and checks["connected"]
-        and checks["induced_edge_mapping_exact"]
-    )
+    ok = all(
+        bool(checks[k])
+        for k in (
+            "nonempty", "size_within_limit", "unique_point_ids", "valid_global_ids",
+            "valid_local_edges", "connected", "induced_edge_mapping_exact", "seed_inside_subgraph",
+        )
+    ) and checks["self_edges"] == 0
     if require_full_size:
         ok = bool(ok and checks["full_size"])
     checks["all_checks_pass"] = bool(ok)
@@ -627,27 +370,11 @@ def validate_inference_partition(
     sampler: ConnectedSubgraphSampler,
     partition: InferencePartition,
 ) -> dict[str, int | bool]:
-    """Validate exact-once coverage, non-overlap, connectivity and edge mapping."""
     sizes = partition.sizes
-    all_ids = (
-        np.concatenate([s.point_ids for s in partition.subgraphs])
-        if partition.subgraphs
-        else np.empty(0, dtype=np.int64)
-    )
-    counts = (
-        np.bincount(all_ids, minlength=sampler.num_nodes)
-        if all_ids.size
-        else np.zeros(sampler.num_nodes, dtype=np.int64)
-    )
-
-    connected_flags = [_is_connected_local(s) for s in partition.subgraphs]
-    mapping_flags = [
-        np.array_equal(s.edge_index, induce_local_edge_index(sampler.adjacency, s.point_ids))
-        for s in partition.subgraphs
-    ]
-
+    all_ids = np.concatenate([s.point_ids for s in partition.subgraphs]) if partition.subgraphs else np.empty(0, dtype=np.int64)
+    counts = np.bincount(all_ids, minlength=sampler.num_nodes) if all_ids.size else np.zeros(sampler.num_nodes, dtype=np.int64)
     checks: dict[str, int | bool] = {
-        "num_subgraphs": int(partition.num_subgraphs),
+        "num_subgraphs": partition.num_subgraphs,
         "total_selected_points": int(all_ids.size),
         "max_subgraph_size": int(sizes.max()) if sizes.size else 0,
         "min_subgraph_size": int(sizes.min()) if sizes.size else 0,
@@ -655,14 +382,19 @@ def validate_inference_partition(
         "points_repeated": int(np.sum(counts > 1)),
         "exact_once_coverage": bool(np.all(counts == 1)),
         "all_sizes_within_limit": bool(np.all(sizes <= sampler.target_size)),
-        "all_subgraphs_connected": bool(all(connected_flags)),
-        "all_edge_mappings_exact": bool(all(mapping_flags)),
+        "all_subgraphs_connected": bool(all(_is_connected_local(s) for s in partition.subgraphs)),
+        "all_edge_mappings_exact": bool(all(
+            np.array_equal(s.edge_index, induce_local_edge_index(sampler.adjacency, s.point_ids))
+            for s in partition.subgraphs
+        )),
+        "all_seeds_inside_subgraphs": bool(all(np.any(s.point_ids == s.seed_id) for s in partition.subgraphs)),
     }
     checks["all_checks_pass"] = bool(
         checks["exact_once_coverage"]
         and checks["all_sizes_within_limit"]
         and checks["all_subgraphs_connected"]
         and checks["all_edge_mappings_exact"]
+        and checks["all_seeds_inside_subgraphs"]
     )
     return checks
 
@@ -677,91 +409,51 @@ def print_partition_summary(partition: InferencePartition) -> None:
         print(f"Largest subgraph:          {sizes.max():,}")
         print(f"Smallest subgraph:         {sizes.min():,}")
         print(f"Full-size subgraphs:       {np.sum(sizes == partition.target_size):,}")
-        print(f"Residual subgraphs:        {np.sum(sizes < partition.target_size):,}")
         print(f"Total covered points:      {sizes.sum():,}")
 
 
 def _load_repository_modules():
     try:
-        from .feature_extraction import load_xyz  # type: ignore
-        from .graph_construction import build_fixed_knn_graph  # type: ignore
+        from .feature_extraction import load_xyz
+        from .graph_construction import build_fixed_knn_graph
     except ImportError:
-        from feature_extraction import load_xyz  # type: ignore
-        from graph_construction import build_fixed_knn_graph  # type: ignore
+        from feature_extraction import load_xyz
+        from graph_construction import build_fixed_knn_graph
     return load_xyz, build_fixed_knn_graph
 
 
 def _main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Sample connected 8,192-point BFS subgraphs from a fixed TLS k-NN graph."
-    )
-    parser.add_argument("input", type=Path, help="Input .csv or .txt point cloud.")
-    parser.add_argument(
-        "--mode",
-        choices=("inference", "training"),
-        default="inference",
-        help="Subgraph mode (default: inference).",
-    )
-    parser.add_argument(
-        "--size",
-        type=int,
-        default=DEFAULT_SUBGRAPH_SIZE,
-        help="Maximum/target subgraph size (default: 8192).",
-    )
-    parser.add_argument("--k", type=int, default=16, help="Global Euclidean k-NN size.")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for training sampling.")
-    parser.add_argument(
-        "--stratum",
-        choices=STRATUM_NAMES,
-        default=None,
-        help="Optional fixed training seed stratum.",
-    )
-    parser.add_argument("--validate", action="store_true", help="Run structural validation.")
+    parser = argparse.ArgumentParser(description="Sample connected subgraphs from a fixed TLS k-NN graph.")
+    parser.add_argument("input", type=Path)
+    parser.add_argument("--mode", choices=("inference", "training"), default="inference")
+    parser.add_argument("--size", type=int, default=DEFAULT_SUBGRAPH_SIZE)
+    parser.add_argument("--k", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--stratum", choices=STRATUM_NAMES, default=None)
+    parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()
 
     load_xyz, build_fixed_knn_graph = _load_repository_modules()
     points = load_xyz(args.input)
-    graph = build_fixed_knn_graph(points, k=args.k, verbose=False)
-    sampler = ConnectedSubgraphSampler(
-        points,
-        graph.edge_index,
-        target_size=args.size,
-    )
-
-    print(f"[Input] {args.input.name}: {points.shape[0]:,} points")
-    print(f"[Fixed graph] k={args.k}, directed edges={graph.edge_index.shape[1]:,}")
-    print(f"[Graph components] {sampler.num_components}")
+    graph = build_fixed_knn_graph(points, k=args.k)
+    sampler = ConnectedSubgraphSampler(points, graph.edge_index, target_size=args.size)
 
     if args.mode == "training":
-        sample = sampler.sample_training(
-            rng=np.random.default_rng(args.seed),
-            requested_stratum=args.stratum,
-            require_full_size=True,
-        )
-        print("\n[Training subgraph]")
-        print(f"Seed ID:                  {sample.seed_id:,}")
-        print(f"Seed stratum:             {sample.stratum}")
-        print(f"Points:                   {sample.num_nodes:,}")
-        print(f"Local directed edges:     {sample.num_edges:,}")
+        sample = sampler.sample_training(np.random.default_rng(args.seed), args.stratum, True)
+        print(f"Training subgraph: {sample.num_nodes:,} points, stratum={sample.stratum}, seed={sample.seed_id}")
         if args.validate:
-            checks = validate_sampled_subgraph(sampler, sample, require_full_size=True)
-            print("\n[Validation]")
-            for key, value in checks.items():
-                print(f"{key:<32} {value}")
+            checks = validate_sampled_subgraph(sampler, sample, True)
+            print(checks)
             if not checks["all_checks_pass"]:
                 raise RuntimeError("Training subgraph validation failed.")
-            print("Status:                          OK")
     else:
         partition = sampler.partition_inference()
         print_partition_summary(partition)
         if args.validate:
             checks = validate_inference_partition(sampler, partition)
-            print("\n[Validation]")
-            for key, value in checks.items():
-                print(f"{key:<32} {value}")
+            print(checks)
             if not checks["all_checks_pass"]:
                 raise RuntimeError("Inference partition validation failed.")
-            print("Status:                          OK")
 
 
 if __name__ == "__main__":
