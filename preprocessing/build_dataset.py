@@ -1,29 +1,17 @@
-"""Build per-tree preprocessing artifacts for occlusion-robust TLS stem detection.
+"""Build per-tree preprocessing artifacts for TLS stem detection.
 
 Author: Shahab Alaedin Baloochi
 
-This module orchestrates the three preprocessing stages used by the repository:
+The preprocessing pipeline loads metric XYZ coordinates, builds the fixed
+symmetric 3D Euclidean k-NN graph, computes the 10D point representation, and
+optionally attaches TreeQSM-derived stem labels. The graph k-NN indices are
+reused by feature extraction so PCA features and network neighbourhoods remain
+aligned.
 
-1. load metric XYZ coordinates,
-2. build the fixed symmetric 3D Euclidean k-NN graph,
-3. compute the 10D point representation (local XYZ + 7 engineered features),
-4. optionally attach TreeQSM-derived binary stem labels,
-5. validate compatibility with connected 8,192-point subgraph sampling.
-
-The fixed graph is the single source of truth for point k-NN neighbourhoods:
-``graph.knn_indices`` is passed directly to feature extraction, so the PCA
-features and the network graph use the same precomputed Euclidean neighbours.
-
-Label convention
-----------------
-The manuscript defines branch index 1 as stem, branch index >1 as non-stem,
-and branch index 0 as unsegmented/excluded. Therefore ``unsegmented_id=0`` is
-the default. Some converted CSV files may use a different sentinel (for
-example -1); this must be supplied explicitly rather than guessed.
-
-Unsegmented points are retained in the geometric arrays and fixed graph so that
-original point IDs remain stable. Their training/evaluation label is -1 and
-``label_mask`` is False. Downstream training/evaluation code must use this mask.
+TreeQSM branch index 1 is stem, values greater than 1 are non-stem, and the
+unsegmented sentinel is excluded. The default sentinel is 0; converted files
+can supply another value through unsegmented_id. Unsegmented points remain
+in geometric arrays and the graph to preserve point indexing.
 """
 
 from __future__ import annotations
@@ -52,7 +40,7 @@ try:
         validate_inference_partition,
         validate_sampled_subgraph,
     )
-except ImportError:  # allow direct execution from preprocessing/
+except ImportError:  # direct module execution
     from feature_extraction import FEATURE_NAMES, FeatureExtractionResult, extract_all_features, load_xyz
     from graph_construction import (
         DEFAULT_K,
