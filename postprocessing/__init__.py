@@ -1,15 +1,10 @@
-"""Post-processing utilities for occlusion-robust TLS stem detection.
+"""Post-processing utilities for TLS stem detection.
 
 Author: Shahab Alaedin Baloochi
 
-This package exposes the repository implementation of manuscript
-post-processing Steps 1 and 2:
-
-1. base-anchored high-confidence stem-core identification;
-2. two-pass axis-envelope-guided connected expansion.
-
-The manuscript's Step 3 TreeQSM-style patch/cylinder filtering is intentionally
-not implemented here.
+This package contains Step 1 high-confidence core identification and Step 2
+two-pass axis-envelope expansion. TreeQSM-style Step 3 filtering is outside
+this package.
 """
 
 from .axis_envelope import (
