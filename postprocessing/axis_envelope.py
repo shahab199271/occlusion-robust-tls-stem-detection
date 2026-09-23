@@ -1,61 +1,18 @@
-"""Axis-envelope-guided stem expansion for TLS point-cloud post-processing.
+"""Axis-envelope-guided stem expansion for TLS post-processing.
 
 Author: Shahab Alaedin Baloochi
 
-This module implements Step 2 of Section 2.8 in the manuscript
-"Occlusion-Robust Stem Detection in Individual-Tree Terrestrial Laser Scanning
-Point Clouds Using Graph-Based Deep Learning".
+The tree height is divided into adaptive vertical bins. In bins containing stem
+reference points, the local centre is the median XY coordinate and the radius
+is the 95th percentile horizontal distance, clipped to 0.05--0.55 m. Missing
+bins use nearest valid-bin propagation, followed by a 7-bin moving average.
+Candidate points are added by BFS on the fixed k-NN graph when
+probability > tau_lo and the point lies inside the local envelope.
 
-Published procedure implemented here
-------------------------------------
-Starting from the high-confidence stem core:
-
-1. Divide the full tree height into uniformly spaced z bins with
-
-       N_bins = min(100, max(15, round(H / 0.20)))
-
-   where H is tree height in metres.
-
-2. In each bin containing current stem-reference points, estimate:
-   * local centre = median horizontal (X, Y) coordinate;
-   * local radius = 95th percentile of horizontal distances to that centre,
-     constrained to [0.05 m, 0.55 m].
-
-3. Fill bins without reference points by nearest-neighbour propagation from the
-   closest valid bin.
-
-4. Smooth centre and radius profiles with a simple arithmetic 7-bin moving
-   average (±3 bins). The smoothed centres define a piecewise-linear centreline.
-
-5. Expand from the current connected stem candidate by breadth-first traversal
-   on the *precomputed* k-NN graph. A point is admitted only when:
-   * predicted stem probability > tau_lo, and
-   * its horizontal distance to the smoothed centreline at that height is not
-     larger than the local envelope radius.
-
-6. Repeat envelope estimation + connected expansion twice. During the second
-   pass the envelope is re-estimated from the first-pass candidate.
-
-Reproducibility boundary
-------------------------
-The manuscript does not publish:
-* numerical values of tau_lo/tau_hi;
-* the endpoint padding convention for the 7-bin moving average;
-* the exact endpoint convention for centreline interpolation;
-* the percentile interpolation convention or vertical-bin boundary convention;
-* whether pass 2 should restart from the original core or continue from the
-  first-pass candidate.
-
-Accordingly, tau_lo is a required caller input. For deterministic handling of
-the endpoint conventions, this implementation uses nearest-value padding for
-the moving average and constant endpoint extension for interpolation. Pass 2
-continues from the connected first-pass candidate while re-estimating the
-envelope from that candidate. These are implementation conventions, not
-claimed manuscript parameters.
-
-Because the paper defines bin centres and radii in horizontal (X, Y) space,
-centreline membership is evaluated as horizontal distance to the interpolated
-centre at the point's z coordinate. No graph is rebuilt or modified here.
+Envelope estimation and expansion are run twice, with the second envelope
+estimated from the first-pass candidate. tau_lo is supplied by the caller.
+Moving-average edges use nearest-value padding and interpolation uses constant
+endpoint extension.
 """
 
 from __future__ import annotations
@@ -124,7 +81,7 @@ class ExpansionPassResult:
 
 @dataclass(frozen=True)
 class TwoPassExpansionResult:
-    """Paper-described two-pass axis-envelope expansion."""
+    """Two-pass axis-envelope expansion result."""
 
     initial_core_mask: NDArray[np.bool_]
     first_pass: ExpansionPassResult
@@ -288,8 +245,7 @@ def _moving_average_1d(
     if window <= 0 or window % 2 == 0:
         raise ValueError("window must be a positive odd integer.")
     if window > array.size:
-        # The paper's adaptive binning guarantees at least 15 bins, so this is
-        # only defensive for direct helper use.
+        # Adaptive binning normally provides at least 15 bins.
         raise ValueError("window cannot exceed the number of values.")
 
     half = window // 2
@@ -302,7 +258,7 @@ def estimate_axis_envelope(
     points: NDArray[np.floating],
     reference_mask: NDArray[np.bool_],
 ) -> AxisEnvelope:
-    """Estimate the manuscript's adaptive, smoothed axis envelope.
+    """Estimate the adaptive, smoothed axis envelope.
 
     ``reference_mask`` is the high-confidence core in pass 1 and the first-pass
     candidate in pass 2.
@@ -533,7 +489,7 @@ def two_pass_axis_envelope_expansion(
     high_confidence_core_mask: NDArray[np.bool_],
     tau_lo: float,
 ) -> TwoPassExpansionResult:
-    """Apply the paper's envelope estimation and BFS expansion exactly twice."""
+    """Apply envelope estimation and BFS expansion twice."""
     xyz = _validate_points(points)
     core = _validate_mask(
         high_confidence_core_mask,
@@ -554,9 +510,7 @@ def two_pass_axis_envelope_expansion(
         tau_lo,
     )
 
-    # Manuscript: re-estimate from the first-pass candidate, then repeat the
-    # same centreline-constrained expansion. Continuing from candidate 1 keeps
-    # the first-pass connected candidate intact while allowing further growth.
+    # Re-estimate from the first-pass candidate, then repeat the expansion.
     envelope2 = estimate_axis_envelope(xyz, pass1.candidate_mask)
     pass2 = expand_connected_candidate(
         xyz,
