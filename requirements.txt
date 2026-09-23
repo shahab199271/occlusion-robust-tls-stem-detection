@@ -1,0 +1,6 @@
+# Runtime dependencies for the current repository.
+# Experiments described in the manuscript used Python 3.12.
+
+numpy
+scipy
+torch
