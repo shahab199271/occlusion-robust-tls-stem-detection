@@ -1,0 +1,15 @@
+# Additional Python packages for the LUMI reference environment.
+#
+# First load:
+# PyTorch/2.7.1-rocm-6.2.4-python-3.12-singularity-20250827
+#
+# PyTorch is supplied by the LUMI container and must not be reinstalled with
+# pip, otherwise the ROCm-enabled build may be replaced.
+
+numpy==2.5.3
+scipy==1.18.1
+pandas==3.0.5
+matplotlib==3.11.1
+scikit-learn==1.9.0
+tqdm==4.70.0
+torch-geometric==2.7.0
