@@ -1,53 +1,21 @@
-"""Paper-faithful synthetic occlusion protocol for TLS tree point clouds.
+"""Synthetic occlusion protocol for TLS tree point clouds.
 
 Author: Shahab Alaedin Baloochi
 
-This module implements the *published* protocol in Sections 2.6--2.7 of the
-manuscript "Occlusion-Robust Stem Detection in Individual-Tree Terrestrial
-Laser Scanning Point Clouds Using Graph-Based Deep Learning".
+Controlled evaluation uses two horizontal bands plus K additional coherent
+3-D regions. K depends on tree height: 0 below 2 m, 1--4 from 2--15 m, and
+5--7 above 15 m. Additional-region placement probabilities are 0.40
+axis-proximal, 0.40 off-axis crown, and 0.20 unconstrained. Axis-proximal
+centres lie within 25% of maximum radial extent; off-axis crown centres lie
+beyond 50% and above z_norm = 0.35. Training creates two independent
+variants and activates each horizontal band with probability 0.8.
 
-Published protocol encoded here
--------------------------------
-* Tree-local placement uses relative height ``z_norm in [0, 1]`` and planar
-  offsets.
-* Each controlled-evaluation scenario contains exactly two horizontal bands
-  plus ``K`` additional spatially coherent 3-D regions.
-* Valid additional-region severity is height dependent:
-    - tree height < 2 m: K = 0
-    - 2 m <= height <= 15 m: K in {1, 2, 3, 4}
-    - height > 15 m: K in {5, 6, 7}
-* Additional-region placement classes are sampled with probabilities
-  0.40 axis-proximal, 0.40 off-axis crown, 0.20 unconstrained.
-* Axis-proximal region centres lie within 25% of the maximum radial extent
-  from the same coarse stem axis used by the stem-axis-distance feature.
-* Off-axis crown centres lie beyond 50% of the maximum radial extent and have
-  z_norm > 0.35.
-* For training augmentation, two independent tree-level variants are produced.
-  Each of the two horizontal bands is independently active with p = 0.8.
-* For controlled evaluation, both horizontal bands are always active.
-* Scenario parameters can be generated once, serialized, and reused across
-  methods so every method sees the same occlusion mask.
+Band thicknesses, primitive dimensions, primitive probabilities, and
+orientation ranges are provided through OcclusionGeometryConfig. A
+vertical_ellipsoid is used for vertically elongated regions.
 
-Reproducibility boundary
-------------------------
-The manuscript does NOT publish numerical distributions for horizontal-band
-thickness, primitive dimensions, primitive-type probabilities, centre sampling
-within an allowed placement class, or orientation distributions. Those values
-are therefore *not guessed* in this module. They are supplied explicitly via
-``OcclusionGeometryConfig``. The paper-level constants above are fixed and
-validated by the code.
-
-The phrase "vertically elongated regions" is also not given an exact analytic
-shape in the manuscript. Here it is represented explicitly as a vertical
-ellipsoid; its dimensions remain caller supplied. This operationalisation is
-identified in metadata as ``vertical_ellipsoid`` rather than silently claimed
-as a paper-specified formula.
-
-Occlusion masks are applied to the complete tree before any occluded-tree input
-representation is built. The caller must then rerun the repository preprocessing
-pipeline on the surviving points, as required by Section 2.7, so geometric
-features and the fixed Euclidean k-NN graph are recomputed from visible points
-only.
+Masks are applied before rebuilding the occluded-tree representation. Features
+and the Euclidean k-NN graph must then be recomputed from surviving points.
 """
 
 from __future__ import annotations
@@ -80,7 +48,7 @@ ScenarioMode = Literal["evaluation", "training"]
 
 @dataclass(frozen=True)
 class Range:
-    """Closed numeric range used only for manuscript-unspecified geometry."""
+    """Closed numeric range for occlusion geometry."""
 
     low: float
     high: float
@@ -118,11 +86,10 @@ class AngleRange:
 
 @dataclass(frozen=True)
 class OcclusionGeometryConfig:
-    """Explicit geometry choices omitted from the manuscript.
+    """Geometry parameters used to sample occlusion regions.
 
-    All horizontal sizes are fractions of the tree's maximum radial extent.
-    All vertical sizes are fractions of tree height. No defaults are provided,
-    because the paper does not report these distributions.
+    Horizontal sizes are fractions of maximum radial extent and vertical sizes
+    are fractions of tree height.
     """
 
     band_thickness_z: Range
@@ -424,7 +391,7 @@ def _sample_additional_region(
         sx = geometry.vertical_radius_x.sample(rng)
         sy = geometry.vertical_radius_y.sample(rng)
         sz = geometry.vertical_radius_z.sample(rng)
-    else:  # defensive
+    else:
         raise RuntimeError(f"Unhandled primitive kind: {kind}")
 
     return OcclusionRegion(
@@ -637,7 +604,7 @@ def _mask_region_normalized(
 
     # Inverse Z-Y-X Euler rotation: transform tree-frame offsets into the
     # primitive's local coordinate system. Orientation distributions are
-    # explicitly caller supplied because the manuscript does not publish them.
+    # Geometry ranges are supplied by the configuration.
     cy, sy = cos(region.yaw_radians), sin(region.yaw_radians)
     cp, sp = cos(region.pitch_radians), sin(region.pitch_radians)
     cr, sr = cos(region.roll_radians), sin(region.roll_radians)
@@ -716,7 +683,7 @@ def remove_occluded_points(
 
 
 def paper_protocol_summary() -> dict[str, object]:
-    """Machine-readable summary of manuscript-explicit constants."""
+    """Return the fixed protocol constants."""
     return {
         "evaluation_horizontal_bands": EVALUATION_BAND_COUNT,
         "training_horizontal_band_probability": TRAINING_BAND_PROBABILITY,
