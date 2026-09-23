@@ -2,8 +2,7 @@
 
 Author: Shahab Alaedin Baloochi
 
-This module connects the model components described in Section 2.3 of the
-manuscript:
+Pipeline:
 
     10D point features
         -> three fixed-graph EdgeConv layers
@@ -11,35 +10,13 @@ manuscript:
         -> fixed-neighbour local multi-head attention + residual
         -> PMA with two learned seed queries
         -> concatenated subgraph context
-        -> feature-wise linear modulation (FiLM)
-        -> point-wise MLP classifier
-        -> one stem logit per point
+        -> FiLM
+        -> 448 -> 256 -> 128 -> 64 -> 1 point-wise classifier
 
-Reproducibility boundary
-------------------------
-The manuscript explicitly reports:
-  * 10 input channels (metric local XYZ + 7 engineered descriptors),
-  * three EdgeConv layers whose outputs are concatenated,
-  * local attention on the unchanged fixed Euclidean k-NN graph,
-  * PMA with exactly two learned seed queries,
-  * FiLM using learned channel-wise scale gamma(g) and shift beta(g),
-  * classifier dimensions 448 -> 256 -> 128 -> 64 -> 1,
-  * ReLU activations,
-  * dropout between classifier layers, with dropout = 0.15 reported in
-    the optimisation settings,
-  * logits during training and sigmoid probabilities during evaluation.
-
-The manuscript does NOT publish the individual EdgeConv widths, attention
-head configuration, PMA head configuration, or the exact neural mapping used
-to generate FiLM gamma/beta from the pooled context. Those details are not
-invented here. Instead, the already-configured backbone, attention and PMA
-modules are injected explicitly, and FiLM receives caller-supplied gamma/beta
-generators. A minimal direct-linear FiLM generator helper is provided for
-experimentation, but is not claimed to reproduce an unpublished original
-implementation detail.
-
-Because the reported classifier begins at 448 channels, this assembly enforces
-a 448-channel refined point representation before FiLM/classification.
+The assembly enforces the reported 10 input channels, 448-channel refined
+representation, two PMA seeds, classifier dimensions, and dropout setting.
+EdgeConv widths, attention/PMA head configuration, and FiLM generators are
+provided through configured submodules.
 """
 
 from __future__ import annotations
@@ -54,7 +31,7 @@ try:
     from .edgeconv import EdgeConvBackboneOutput, ThreeLayerFixedEdgeConvBackbone
     from .local_attention import FixedLocalMultiheadAttention
     from .pma import PoolingByMultiheadAttention
-except ImportError:  # allow direct execution/import from models/
+except ImportError:  # direct module execution
     from edgeconv import EdgeConvBackboneOutput, ThreeLayerFixedEdgeConvBackbone
     from local_attention import FixedLocalMultiheadAttention
     from pma import PoolingByMultiheadAttention
@@ -96,14 +73,7 @@ def make_linear_film_generators(
     *,
     bias: bool = True,
 ) -> tuple[nn.Linear, nn.Linear]:
-    """Create direct linear context->gamma and context->beta generators.
-
-    This is a minimal standard FiLM realization and a convenience for
-    experiments. The stem-detection manuscript states learned channel-wise
-    scaling and shifting, but does not publish the original generator
-    architecture; therefore this helper is not used implicitly by
-    ``StemDetector``.
-    """
+    """Create linear context-to-gamma and context-to-beta FiLM generators."""
     if context_channels <= 0 or feature_channels <= 0:
         raise ValueError("context_channels and feature_channels must be positive.")
     return (
@@ -253,11 +223,10 @@ class StemPointClassifier(nn.Module):
 
 
 class StemDetector(nn.Module):
-    """Assemble the complete paper-described detector for one connected subgraph.
+    """Assemble the detector for one connected subgraph.
 
-    The class deliberately receives configured submodules rather than guessing
-    unpublished widths/head counts. It performs strict cross-module dimension
-    checks so incompatible configurations fail at construction time.
+    Configured submodules are passed in explicitly and checked for compatible
+    dimensions.
     """
 
     def __init__(
@@ -302,7 +271,7 @@ class StemDetector(nn.Module):
             raise ValueError(f"pma.model_dim must be {PAPER_REFINED_CHANNELS}.")
         if pma.num_seeds != PAPER_PMA_SEEDS:
             raise ValueError(
-                f"The manuscript specifies exactly {PAPER_PMA_SEEDS} PMA seed queries."
+                f"Expected exactly {PAPER_PMA_SEEDS} PMA seed queries."
             )
         if film.feature_channels != PAPER_REFINED_CHANNELS:
             raise ValueError(f"film.feature_channels must be {PAPER_REFINED_CHANNELS}.")
@@ -419,7 +388,7 @@ class StemDetector(nn.Module):
                 conditioned_features=film_output.conditioned,
             )
         if return_probabilities:
-            if probabilities is None:  # defensive; logically unreachable
+            if probabilities is None:
                 raise RuntimeError("Probability output was requested but not computed.")
             return probabilities
         return logits
