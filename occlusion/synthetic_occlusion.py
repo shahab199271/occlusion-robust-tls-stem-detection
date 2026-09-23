@@ -217,13 +217,16 @@ class OcclusionScenario:
     def load_json(cls, path: str | Path) -> "OcclusionScenario":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         regions = tuple(OcclusionRegion(**item) for item in payload["regions"])
-        return cls(
+        seed_value = payload.get("seed")
+        scenario = cls(
             mode=payload["mode"],
             tree_height_m=float(payload["tree_height_m"]),
             k_additional=int(payload["k_additional"]),
             regions=regions,
-            seed=payload.get("seed"),
+            seed=None if seed_value is None else int(seed_value),
         )
+        validate_scenario(scenario)
+        return scenario
 
 
 @dataclass(frozen=True)
@@ -500,23 +503,31 @@ def generate_two_training_variants(
     *,
     seed: int | None = None,
 ) -> tuple[OcclusionScenario, OcclusionScenario]:
-    """Create the two distinct tree-level variants stated in Section 2.7."""
-    master = np.random.default_rng(seed)
-    child_seeds = master.integers(0, np.iinfo(np.int64).max, size=2, dtype=np.int64)
+    """Create the two independent tree-level variants stated in Section 2.7.
+
+    ``SeedSequence.spawn`` gives the two variants independent deterministic
+    random streams when a master seed is supplied, without any possibility of
+    accidentally assigning the same child seed to both variants.
+    """
+    seed_sequence = np.random.SeedSequence(seed)
+    children = seed_sequence.spawn(2)
+    child_seeds = tuple(
+        int(child.generate_state(1, dtype=np.uint64)[0]) for child in children
+    )
     return (
         generate_scenario(
             frame,
             k_additional,
             geometry,
             mode="training",
-            seed=int(child_seeds[0]),
+            seed=child_seeds[0],
         ),
         generate_scenario(
             frame,
             k_additional,
             geometry,
             mode="training",
-            seed=int(child_seeds[1]),
+            seed=child_seeds[1],
         ),
     )
 
@@ -535,14 +546,41 @@ def validate_scenario(scenario: OcclusionScenario) -> None:
     if scenario.mode == "evaluation" and not all(region.active for region in bands):
         raise ValueError("Both horizontal bands must be active during evaluation.")
 
+    finite_fields = (
+        "center_x",
+        "center_y",
+        "center_z_norm",
+        "size_x",
+        "size_y",
+        "size_z",
+        "yaw_radians",
+        "pitch_radians",
+        "roll_radians",
+    )
     for region in scenario.regions:
+        if any(not np.isfinite(float(getattr(region, field))) for field in finite_fields):
+            raise ValueError("All region geometry/orientation values must be finite.")
         if not 0.0 <= region.center_z_norm <= 1.0:
             raise ValueError("Region center_z_norm must lie in [0, 1].")
         if region.size_z <= 0.0:
             raise ValueError("Region vertical size must be positive.")
 
+    for band in bands:
+        if band.placement != "stem_intersecting":
+            raise ValueError("Horizontal bands must use placement='stem_intersecting'.")
+
+    valid_kinds = {"ellipsoid", "box", "cylinder", "vertical_ellipsoid"}
     for region in scenario.regions[EVALUATION_BAND_COUNT:]:
+        if region.kind not in valid_kinds:
+            raise ValueError(f"Unknown additional-region primitive: {region.kind}")
+        if not region.active:
+            raise ValueError("Only training horizontal bands may be inactive; additional regions are active.")
+        if region.size_x <= 0.0 or region.size_y <= 0.0:
+            raise ValueError("Additional-region horizontal sizes must be positive.")
+
         radial = float(np.hypot(region.center_x, region.center_y))
+        if radial > 1.0 + 1e-12:
+            raise ValueError("Additional-region centre exceeds the normalized maximum radial extent.")
         if region.placement == "axis_proximal":
             if radial > AXIS_PROXIMAL_MAX_RADIAL_FRACTION + 1e-12:
                 raise ValueError("Axis-proximal centre exceeds 25% maximum radial extent.")
