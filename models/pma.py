@@ -1,46 +1,15 @@
-"""Pooling by Multihead Attention (PMA) for subgraph-level TLS context.
+"""Pooling by Multihead Attention (PMA) for subgraph-level context.
 
 Author: Shahab Alaedin Baloochi
 
-This module implements the global-context pooling stage described in Section 2.3
-of the manuscript. The refined point embeddings of each connected subgraph are
-viewed as an unordered set and pooled by *two learned seed queries*. The two PMA
-outputs are concatenated to form one subgraph-level context vector for the
-subsequent FiLM conditioning block.
+Refined point embeddings are treated as an unordered set and pooled with two
+learned seed queries. The two seed descriptors are concatenated and passed to
+FiLM. The implementation follows the Set Transformer PMA/MAB structure with a
+residual row-wise feed-forward update. use_layer_norm remains configurable,
+and no post-PMA SAB is added.
 
-Source alignment
-----------------
-The manuscript states that:
-  * PMA is applied independently within each connected 8,192-point subgraph,
-  * exactly two learned seed queries are used,
-  * the resulting two descriptors are concatenated,
-  * the pooled context is then used for FiLM conditioning.
-
-The implementation follows the Set Transformer PMA/MAB construction of
-Lee et al. (2019): learned seeds query the unordered point set through multi-head
-attention, followed by a residual row-wise feed-forward update. Attention is
-scaled by ``sqrt(model_dim)``, matching the Set Transformer paper and its
-official PyTorch implementation. The formal Set Transformer definition writes
-``PMA_k(Z) = MAB(S, rFF(Z))``, while the authors' linked PyTorch ``PMA`` class
-passes the encoded set directly to ``MAB``. Because the stem-detection manuscript
-likewise says the refined point embeddings are pooled directly and does not
-specify an additional pre-PMA rFF, this repository follows the linked reference
-implementation at that boundary rather than inventing an extra layer.
-
-The formal Set Transformer paper includes LayerNorm in MAB, while the linked
-reference implementation makes LayerNorm optional; because the stem-detection
-manuscript does not state which choice was used, ``use_layer_norm`` is an
-explicit constructor argument rather than a hidden assumption.
-
-The Set Transformer paper also discusses an additional SAB after PMA when
-multiple outputs must explicitly interact. The stem-detection manuscript does
-*not* describe such a post-PMA SAB: it says the two descriptors are concatenated
-and passed to FiLM. Therefore this file intentionally stops after PMA and
-concatenation.
-
-No graph operation occurs here. PMA pools the refined point embeddings of one
-subgraph as a set and is permutation-invariant to point ordering (with dropout
-disabled, as in evaluation).
+PMA operates independently within each connected subgraph and does not modify
+the graph.
 """
 
 from __future__ import annotations
@@ -72,18 +41,14 @@ class PoolingByMultiheadAttention(nn.Module):
     num_heads:
         Number of attention heads. ``model_dim`` must be divisible by it.
     use_layer_norm:
-        Explicitly selects whether the two MAB LayerNorm operations are used.
-        The stem manuscript does not publish this implementation detail.
+        Selects whether the two MAB LayerNorm operations are used.
     num_seeds:
-        Number of learned PMA seed queries. The manuscript uses exactly 2, which
-        is the repository default.
+        Number of learned PMA seed queries; the default is 2.
     qkv_bias, out_bias, feedforward_bias:
         Bias choices are explicit because they are not specified by the
         manuscript.
     attention_dropout, feedforward_dropout:
-        Optional dropout probabilities. Defaults are zero, matching the Set
-        Transformer MAB description (which omits dropout) and avoiding an
-        unpublished regularisation choice inside PMA.
+        Optional attention and feed-forward dropout probabilities.
 
     Input shapes
     ------------
@@ -152,7 +117,7 @@ class PoolingByMultiheadAttention(nn.Module):
         self.output_projection = nn.Linear(self.model_dim, self.model_dim, bias=out_bias)
 
         # Row-wise residual feed-forward update. The official Set Transformer
-        # implementation uses a same-width Linear + ReLU here, so no unpublished
+        # implementation uses a same-width Linear + ReLU here, so no extra
         # hidden width is introduced.
         self.feedforward = nn.Linear(
             self.model_dim,
