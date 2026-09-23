@@ -1,40 +1,14 @@
-"""High-confidence stem-core identification for TLS post-processing.
+"""High-confidence stem-core identification and envelope post-processing.
 
 Author: Shahab Alaedin Baloochi
 
-This module implements Step 1 of Section 2.8 in the manuscript
-"Occlusion-Robust Stem Detection in Individual-Tree Terrestrial Laser Scanning
-Point Clouds Using Graph-Based Deep Learning".
+Step 1 thresholds predicted stem probabilities at tau_hi, forms connected
+components on the fixed symmetric k-NN graph, and keeps the component whose
+lowest point is closest to the tree base. No gap filling is performed.
 
-Published procedure implemented here
-------------------------------------
-1. Apply a strict global high-confidence threshold ``tau_hi`` to the predicted
-   stem probabilities.
-2. Group points with probability >= ``tau_hi`` into connected components using
-   the *precomputed* symmetric Euclidean k-NN graph.
-3. Retain the component whose lowest point is closest to the tree base.
-4. Perform no reconstruction, interpolation, or gap filling.
-
-The manuscript does not publish a numerical value for ``tau_hi``. Therefore it
-is a required caller input rather than a guessed default.
-
-Reproducibility boundary
-------------------------
-The paper describes selecting the component "whose lowest point is closest to
-the tree base" but does not give a separate numerical tree-base point or a
-tie-breaking rule for components with identical lowest height. Because the
-criterion is expressed through the *lowest point*, this implementation uses the
-tree's minimum z as the base height and selects the component with the smallest
-vertical distance between its minimum z and that base height. This is equivalent
-to selecting the component with the smallest minimum z.
-
-If two or more components have exactly the same base distance, the paper does
-not specify what to do. For deterministic behaviour, ties are resolved by:
-    1. larger component size;
-    2. smaller minimum original point index.
-
-No ground-truth labels are used by this module, and the graph is never rebuilt
-or modified.
+The tree minimum z is used as the base height. Equal base-distance ties are
+resolved by larger component size and then smaller original point index.
+tau_hi and tau_lo are caller-supplied.
 """
 
 from __future__ import annotations
@@ -51,7 +25,7 @@ try:
         TwoPassExpansionResult,
         two_pass_axis_envelope_expansion,
     )
-except ImportError:  # allow direct execution from postprocessing/
+except ImportError:  # direct module execution
     from axis_envelope import (
         TwoPassExpansionResult,
         two_pass_axis_envelope_expansion,
@@ -104,10 +78,9 @@ class HighConfidenceCoreResult:
 
 @dataclass(frozen=True)
 class CoreEnvelopePostprocessingResult:
-    """Combined output of manuscript post-processing Steps 1 and 2 only.
+    """Combined output of post-processing Steps 1 and 2.
 
-    Step 3 (TreeQSM-style local cylinder filtering) is intentionally not
-    included in this repository wrapper.
+    TreeQSM-style Step 3 filtering is outside this wrapper.
     """
 
     tau_hi: float
@@ -243,8 +216,7 @@ def _select_base_anchored_component(
     if not components:
         raise ValueError("No high-confidence connected components are available.")
 
-    # Paper criterion first: lowest point closest to tree base.
-    # Deterministic tie-breaks are explicitly repository conventions.
+    # Primary criterion: lowest point closest to the tree base.
     return min(
         components,
         key=lambda component: (
@@ -261,34 +233,10 @@ def identify_high_confidence_core(
     edge_index: NDArray[np.integer],
     tau_hi: float,
 ) -> HighConfidenceCoreResult:
-    """Identify the paper's single base-anchored high-confidence stem core.
+    """Identify a single base-anchored high-confidence stem core.
 
-    Parameters
-    ----------
-    points:
-        Whole-tree XYZ coordinates in metric units. Global or tree-local XY may
-        be used; only z and point order enter Step 1.
-    probabilities:
-        One predicted stem probability per point.
-    edge_index:
-        Precomputed symmetric whole-tree Euclidean k-NN graph. Connectivity is
-        used exactly as supplied; the graph is not rebuilt in feature space.
-    tau_hi:
-        Strict high-confidence threshold from the post-processing configuration.
-        The manuscript requires probability >= tau_hi for Step 1 but does not
-        publish the numerical value.
-
-    Returns
-    -------
-    HighConfidenceCoreResult
-        Masks and component metadata aligned to the original point order.
-
-    Raises
-    ------
-    RuntimeError
-        If no point reaches tau_hi. The manuscript does not specify a fallback,
-        so this implementation does not silently lower the threshold or create
-        a core by another method.
+    tau_hi is applied with probability >= tau_hi. The fixed graph is used only
+    for connected-component membership.
     """
     xyz = _validate_points(points)
     probs = _validate_probabilities(probabilities, xyz.shape[0])
@@ -299,8 +247,7 @@ def identify_high_confidence_core(
     high_ids = np.flatnonzero(high_mask).astype(np.int64, copy=False)
     if high_ids.size == 0:
         raise RuntimeError(
-            "No point satisfies probability >= tau_hi. "
-            "The manuscript does not define a fallback core."
+            "No point satisfies probability >= tau_hi."
         )
 
     induced = adjacency[high_ids][:, high_ids].tocsr()
@@ -360,35 +307,9 @@ def postprocess_core_envelope(
     tau_hi: float,
     tau_lo: float,
 ) -> CoreEnvelopePostprocessingResult:
-    """Run manuscript post-processing Steps 1 and 2 as one pipeline.
+    """Run post-processing Steps 1 and 2 as one pipeline.
 
-    This function intentionally stops after the second axis-envelope expansion
-    pass. It does *not* implement Step 3 (TreeQSM-style patch/cylinder
-    filtering).
-
-    Parameters
-    ----------
-    points:
-        Whole-tree metric XYZ coordinates aligned with ``probabilities`` and
-        ``edge_index``.
-    probabilities:
-        One predicted stem probability per point, normally the full-tree output
-        of ``inference/inference.py``.
-    edge_index:
-        The same precomputed symmetric Euclidean k-NN graph used by the
-        repository preprocessing/inference pipeline.
-    tau_hi:
-        Required high-confidence threshold for Step 1. The manuscript does not
-        publish its numerical value.
-    tau_lo:
-        Required lower expansion threshold for Step 2. The manuscript requires
-        ``tau_lo < tau_hi`` and does not publish its numerical value.
-
-    Returns
-    -------
-    CoreEnvelopePostprocessingResult
-        Step-1 core metadata plus both Step-2 expansion passes, all aligned to
-        original point order.
+    Step 3 TreeQSM-style patch/cylinder filtering is not included.
     """
     hi, lo = _validate_threshold_pair(tau_hi, tau_lo)
 
