@@ -2,38 +2,16 @@
 
 Author: Shahab Alaedin Baloochi
 
-This module implements the inference procedure described in Sections 2.4--2.5
-of the manuscript "Occlusion-Robust Stem Detection in Individual-Tree
-Terrestrial Laser Scanning Point Clouds Using Graph-Based Deep Learning".
+Trees are processed with non-overlapping connected subgraphs until every point
+is covered exactly once. Crossing edges are omitted within each forward pass,
+and subgraph outputs are scattered back to original point order. Logits are
+converted to probabilities with sigmoid and a fixed decision threshold is
+applied.
 
-Paper-level behaviour implemented here
---------------------------------------
-* Trees are processed sequentially through non-overlapping connected subgraphs.
-* Every point is covered exactly once.
-* Edges crossing subgraph boundaries are omitted in each forward pass.
-* One logit is produced per point and converted to a stem probability with a
-  sigmoid.
-* Subgraph predictions are scattered back to original point order to obtain a
-  full-tree prediction.
-* The decision threshold is fixed across test trees/visibility conditions.
-  The manuscript's primary threshold is 0.50; 0.63 is reported only as a
-  sensitivity threshold.
-
-The exact deterministic rule used to partition a whole tree into inference
-blocks is not specified in the manuscript. This module therefore delegates
-partitioning entirely to ``preprocessing.subgraph_sampling``. That repository
-module already documents and validates its deterministic, connectivity-
-preserving implementation choice. Inference does not rebuild or alter the
-graph.
-
-For synthetically occluded trees, callers must first rebuild the complete
-occluded-tree representation from the surviving points (features + Euclidean
-k-NN graph), as required by Section 2.7. This module then treats that rebuilt
-representation exactly like a clean tree.
-
-Threshold selection itself belongs to validation/evaluation code. This module
-only applies a supplied fixed threshold and does not search for an operating
-point.
+Whole-tree partitioning is handled by preprocessing.subgraph_sampling.
+Occluded trees must be preprocessed again after point removal so features and
+the Euclidean k-NN graph reflect only surviving points. Threshold selection is
+handled by evaluation code; this module only applies a supplied threshold.
 """
 
 from __future__ import annotations
@@ -366,17 +344,10 @@ def infer_tree_dataset(
     partition: Optional[InferencePartition] = None,
     validate_partition: bool = True,
 ) -> FullTreeInferenceResult:
-    """Run paper-aligned exhaustive inference on a preprocessed whole tree.
+    """Run exhaustive inference on a preprocessed whole tree.
 
-    The function uses:
-      * ``dataset.node_features`` as network features,
-      * ``dataset.features.local_xyz`` as positional coordinates,
-      * ``dataset.graph.edge_index`` only through the repository's inference
-        partitioner.
-
-    No labels are read or used. This is intentional: the manuscript applies
-    the model to the full TLS cloud and restricts labels only during metric
-    computation.
+    Uses dataset.node_features as model input and dataset.features.local_xyz
+    as positional coordinates. Labels are not used during inference.
     """
     if not isinstance(dataset, BuiltTreeDataset):
         raise TypeError("dataset must be preprocessing.BuiltTreeDataset.")
@@ -399,8 +370,7 @@ def infer_tree_dataset(
         atol=1e-12,
     ):
         raise ValueError(
-            "The first three node-feature channels do not match local_xyz; "
-            "refusing inference because feature/position alignment is uncertain."
+            "The first three node-feature channels do not match local_xyz."
         )
 
     sampler = dataset.make_sampler()
@@ -475,7 +445,7 @@ def validate_inference_result(result: FullTreeInferenceResult) -> dict[str, bool
     }
 
     # Sigmoid/logit consistency is checked in float32 because stored inference
-    # arrays intentionally use float32 for compact full-tree outputs.
+    # Stored inference arrays use float32.
     expected = torch.sigmoid(torch.from_numpy(result.logits)).numpy()
     checks["sigmoid_consistent"] = bool(
         np.allclose(
@@ -499,7 +469,7 @@ def save_inference_npz(
     """Save raw full-tree outputs without changing original point order."""
     checks = validate_inference_result(result)
     if not bool(checks["all_checks_pass"]):
-        raise ValueError(f"Refusing to save an invalid inference result: {checks}")
+        raise ValueError(f"Invalid inference result: {checks}")
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
