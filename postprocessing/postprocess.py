@@ -46,6 +46,17 @@ from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
+try:
+    from .axis_envelope import (
+        TwoPassExpansionResult,
+        two_pass_axis_envelope_expansion,
+    )
+except ImportError:  # allow direct execution from postprocessing/
+    from axis_envelope import (
+        TwoPassExpansionResult,
+        two_pass_axis_envelope_expansion,
+    )
+
 
 EPS = 1e-12
 
@@ -91,6 +102,29 @@ class HighConfidenceCoreResult:
         return np.flatnonzero(self.core_mask).astype(np.int64, copy=False)
 
 
+@dataclass(frozen=True)
+class CoreEnvelopePostprocessingResult:
+    """Combined output of manuscript post-processing Steps 1 and 2 only.
+
+    Step 3 (TreeQSM-style local cylinder filtering) is intentionally not
+    included in this repository wrapper.
+    """
+
+    tau_hi: float
+    tau_lo: float
+    core: HighConfidenceCoreResult
+    expansion: TwoPassExpansionResult
+
+    @property
+    def final_candidate_mask(self) -> NDArray[np.bool_]:
+        """Final candidate after the second axis-envelope expansion pass."""
+        return self.expansion.final_candidate_mask
+
+    @property
+    def num_final_points(self) -> int:
+        return int(self.final_candidate_mask.sum())
+
+
 def _validate_points(points: NDArray[np.floating]) -> NDArray[np.float64]:
     xyz = np.asarray(points, dtype=np.float64)
     if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] == 0:
@@ -121,6 +155,19 @@ def _validate_tau_hi(tau_hi: float) -> float:
     if not np.isfinite(value) or not 0.0 <= value <= 1.0:
         raise ValueError("tau_hi must be finite and lie in [0,1].")
     return value
+
+
+def _validate_threshold_pair(tau_hi: float, tau_lo: float) -> tuple[float, float]:
+    """Validate the manuscript requirement tau_lo < tau_hi."""
+    hi = _validate_tau_hi(tau_hi)
+    lo = float(tau_lo)
+    if not np.isfinite(lo) or not 0.0 <= lo <= 1.0:
+        raise ValueError("tau_lo must be finite and lie in [0,1].")
+    if not lo < hi:
+        raise ValueError(
+            "Post-processing requires tau_lo < tau_hi, as stated in the manuscript."
+        )
+    return hi, lo
 
 
 def _build_symmetric_adjacency(
@@ -305,6 +352,159 @@ def identify_high_confidence_core(
     return result
 
 
+def postprocess_core_envelope(
+    points: NDArray[np.floating],
+    probabilities: NDArray[np.floating],
+    edge_index: NDArray[np.integer],
+    *,
+    tau_hi: float,
+    tau_lo: float,
+) -> CoreEnvelopePostprocessingResult:
+    """Run manuscript post-processing Steps 1 and 2 as one pipeline.
+
+    This function intentionally stops after the second axis-envelope expansion
+    pass. It does *not* implement Step 3 (TreeQSM-style patch/cylinder
+    filtering).
+
+    Parameters
+    ----------
+    points:
+        Whole-tree metric XYZ coordinates aligned with ``probabilities`` and
+        ``edge_index``.
+    probabilities:
+        One predicted stem probability per point, normally the full-tree output
+        of ``inference/inference.py``.
+    edge_index:
+        The same precomputed symmetric Euclidean k-NN graph used by the
+        repository preprocessing/inference pipeline.
+    tau_hi:
+        Required high-confidence threshold for Step 1. The manuscript does not
+        publish its numerical value.
+    tau_lo:
+        Required lower expansion threshold for Step 2. The manuscript requires
+        ``tau_lo < tau_hi`` and does not publish its numerical value.
+
+    Returns
+    -------
+    CoreEnvelopePostprocessingResult
+        Step-1 core metadata plus both Step-2 expansion passes, all aligned to
+        original point order.
+    """
+    hi, lo = _validate_threshold_pair(tau_hi, tau_lo)
+
+    core = identify_high_confidence_core(
+        points,
+        probabilities,
+        edge_index,
+        tau_hi=hi,
+    )
+
+    expansion = two_pass_axis_envelope_expansion(
+        points,
+        probabilities,
+        edge_index,
+        core.core_mask,
+        tau_lo=lo,
+    )
+
+    if not np.array_equal(expansion.initial_core_mask, core.core_mask):
+        raise RuntimeError(
+            "Step-2 initial core does not exactly match the Step-1 selected core."
+        )
+    if not np.all(core.core_mask <= expansion.first_pass.candidate_mask):
+        raise RuntimeError("Step 2 unexpectedly removed Step-1 core points.")
+    if not np.all(
+        expansion.first_pass.candidate_mask <= expansion.second_pass.candidate_mask
+    ):
+        raise RuntimeError("Second expansion pass unexpectedly removed first-pass points.")
+
+    result = CoreEnvelopePostprocessingResult(
+        tau_hi=hi,
+        tau_lo=lo,
+        core=core,
+        expansion=expansion,
+    )
+    checks = validate_core_envelope_postprocessing_result(
+        result,
+        points,
+        probabilities,
+    )
+    if not bool(checks["all_checks_pass"]):
+        raise RuntimeError(
+            "Combined Step-1/Step-2 post-processing validation failed: "
+            f"{checks}"
+        )
+    return result
+
+
+def validate_core_envelope_postprocessing_result(
+    result: CoreEnvelopePostprocessingResult,
+    points: NDArray[np.floating],
+    probabilities: NDArray[np.floating],
+) -> dict[str, bool | int]:
+    """Validate the combined Steps 1-2 result without recomputing the pipeline."""
+    if not isinstance(result, CoreEnvelopePostprocessingResult):
+        raise TypeError("result must be CoreEnvelopePostprocessingResult.")
+
+    xyz = _validate_points(points)
+    probs = _validate_probabilities(probabilities, xyz.shape[0])
+
+    threshold_pair_valid = True
+    try:
+        hi, lo = _validate_threshold_pair(result.tau_hi, result.tau_lo)
+    except (TypeError, ValueError):
+        threshold_pair_valid = False
+        hi = float("nan")
+        lo = float("nan")
+
+    core_checks = validate_high_confidence_core_result(result.core, xyz, probs)
+    expansion = result.expansion
+    final_mask = np.asarray(expansion.final_candidate_mask)
+
+    shape_ok = bool(final_mask.shape == (xyz.shape[0],))
+    final_nonempty = bool(shape_ok and np.any(final_mask))
+    core_matches = bool(
+        expansion.initial_core_mask.shape == result.core.core_mask.shape
+        and np.array_equal(expansion.initial_core_mask, result.core.core_mask)
+    )
+    monotonic = bool(
+        expansion.first_pass.candidate_mask.shape == result.core.core_mask.shape
+        and expansion.second_pass.candidate_mask.shape == result.core.core_mask.shape
+        and np.all(result.core.core_mask <= expansion.first_pass.candidate_mask)
+        and np.all(
+            expansion.first_pass.candidate_mask
+            <= expansion.second_pass.candidate_mask
+        )
+    )
+
+    # Because Step 1 has probability >= tau_hi and tau_hi > tau_lo, every core
+    # point also exceeds tau_lo. Every subsequently added Step-2 point must
+    # strictly exceed tau_lo.
+    final_probability_consistent = bool(
+        shape_ok
+        and threshold_pair_valid
+        and np.all(probs[final_mask] > lo)
+    )
+
+    checks: dict[str, bool | int] = {
+        "threshold_pair_valid": threshold_pair_valid,
+        "stored_thresholds_match_core": bool(
+            threshold_pair_valid
+            and np.isclose(result.core.tau_hi, hi, rtol=0.0, atol=0.0)
+        ),
+        "core_valid": bool(core_checks.get("all_checks_pass", False)),
+        "final_mask_shape": shape_ok,
+        "final_nonempty": final_nonempty,
+        "step2_starts_from_step1_core": core_matches,
+        "candidate_masks_monotonic": monotonic,
+        "final_probability_consistent": final_probability_consistent,
+    }
+    checks["all_checks_pass"] = bool(
+        all(bool(value) for key, value in checks.items() if key != "all_checks_pass")
+    )
+    return checks
+
+
 def validate_high_confidence_core_result(
     result: HighConfidenceCoreResult,
     points: NDArray[np.floating],
@@ -374,6 +574,9 @@ def validate_high_confidence_core_result(
 __all__ = [
     "HighConfidenceComponent",
     "HighConfidenceCoreResult",
+    "CoreEnvelopePostprocessingResult",
     "identify_high_confidence_core",
     "validate_high_confidence_core_result",
+    "postprocess_core_envelope",
+    "validate_core_envelope_postprocessing_result",
 ]
