@@ -2,35 +2,20 @@
 
 Author: Shahab Alaedin Baloochi
 
-Implements the local-attention stage described in Section 2.3 of the manuscript:
-a lightweight multi-head attention block refines the concatenated EdgeConv
-representation over each point's *fixed* k-NN neighbourhood, uses learnable
-relative positional information, and preserves the incoming multi-scale
-representation through a residual connection.
+The block refines the concatenated EdgeConv representation over the supplied
+fixed k-NN graph. Attention combines scaled query-key similarity with a
+learnable bias from relative XYZ and adds the update through a residual
+connection. Head count, head width, and positional-bias network widths are
+constructor parameters.
 
-Important reproducibility note
-------------------------------
-The manuscript states the behaviour above but does not publish the exact number
-of heads, per-head width, internal positional-embedding widths, or the precise
-algebra used to inject positional embeddings into attention logits. Those
-values/formulae are therefore not guessed here. This module implements a
-standard source-consistent realization in which feature-content similarity is a
-scaled query-key dot product and a caller-specified learnable embedding of
-relative XYZ contributes an additive per-head attention bias. All unpublished
-architectural widths are explicit constructor arguments.
-
-For a directed fixed-graph edge ``j -> i`` stored as
-``edge_index[:, e] = [j, i]``:
+For an edge j -> i:
 
     score_ij^h = <q_i^h, k_j^h> / sqrt(d_h) + b_h(p_j - p_i)
-    alpha_ij^h = softmax_j(score_ij^h)  over neighbours j of target i
+    alpha_ij^h = softmax_j(score_ij^h)
     a_i^h = sum_j alpha_ij^h v_j^h
     y_i = x_i + W_o concat_h(a_i^h)
 
-No k-NN search, graph reconstruction, self-edge insertion, or learned-space
-neighbour recomputation occurs in this file. Isolated nodes in a local induced
-subgraph receive zero attention update and therefore pass through the residual
-path unchanged (when output bias is disabled, the default).
+No graph reconstruction or learned-space neighbour search is performed.
 """
 
 from __future__ import annotations
@@ -57,10 +42,9 @@ def make_relative_position_bias_mlp(
     *,
     activation_factory: Callable[[], nn.Module] = nn.ReLU,
 ) -> nn.Sequential:
-    """Build a learnable relative-XYZ -> per-head attention-bias network.
+    """Build a learnable relative-XYZ to per-head attention-bias network.
 
-    Parameters are intentionally explicit. The manuscript does not report the
-    hidden widths of its relative positional embedding network.
+    Hidden widths are supplied by the caller.
     """
     if num_heads <= 0:
         raise ValueError("num_heads must be positive.")
