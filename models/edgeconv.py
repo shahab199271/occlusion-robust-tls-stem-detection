@@ -2,17 +2,10 @@
 
 Author: Shahab Alaedin Baloochi
 
-Implements the EdgeConv behaviour described in Section 2.3 of the manuscript:
-messages are formed from a target point feature and the feature difference to a
-neighbour, then aggregated with a channel-wise maximum over the *fixed* input
-graph. The module never computes k-NN neighbourhoods and never changes
-``edge_index``.
-
-The manuscript specifies three EdgeConv layers and concatenation of all three
-layer outputs, but it does not report the unpublished internal message-MLP
-channel widths. To avoid inventing those values, this file keeps the message
-network fully caller-specified. ``make_message_mlp`` is only a convenience
-builder whose hidden/output widths must be supplied explicitly by the caller.
+Edge messages use [x_i, x_j - x_i] and are aggregated with a channel-wise
+maximum over the supplied fixed graph. The module does not recompute k-NN
+neighbourhoods. Three EdgeConv layer outputs are concatenated for the
+multi-scale representation. Message-MLP widths are configured by the caller.
 """
 
 from __future__ import annotations
@@ -39,11 +32,10 @@ def make_message_mlp(
     *,
     activation_factory: Callable[[], nn.Module] = nn.ReLU,
 ) -> nn.Sequential:
-    """Build an explicit EdgeConv message MLP.
+    """Build an EdgeConv message MLP.
 
-    The EdgeConv pair representation has ``2 * in_channels`` channels because
-    each edge uses ``[x_i, x_j - x_i]``. Hidden widths are intentionally not
-    defaulted: the manuscript does not state the original internal widths.
+    The pair representation has 2 * in_channels channels. Hidden widths are
+    supplied by the caller.
     """
     if in_channels <= 0 or out_channels <= 0:
         raise ValueError("in_channels and out_channels must be positive.")
