@@ -1,6 +1,13 @@
-# Runtime dependencies for the current repository.
-# Experiments described in the manuscript used Python 3.12.
+# Reproducible Python environment for the paper code.
+# Reference platform: Python 3.12.
+# LUMI reference: PyTorch 2.7.1 with ROCm 6.2.4.
+# See LUMI_ENVIRONMENT.md for the HPC environment.
 
-numpy
-scipy
-torch
+numpy==2.5.3
+scipy==1.18.1
+pandas==3.0.5
+matplotlib==3.11.1
+scikit-learn==1.9.0
+tqdm==4.70.0
+torch==2.7.1
+torch-geometric==2.7.0
