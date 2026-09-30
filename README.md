@@ -168,6 +168,12 @@ The envelope uses adaptive vertical bins, median horizontal centres, a 95th-perc
 
 The final TreeQSM-based patch/cylinder filtering and cylinder reconstruction used in the study are part of the TreeQSM workflow and are not duplicated in this repository.
 
+## TreeQSM
+
+For the TreeQSM-dependent steps, use **TreeQSM 2.4.1** from the official repository:
+
+https://github.com/InverseTampere/TreeQSM
+
 ## Evaluation
 
 The `evaluation` package provides:
