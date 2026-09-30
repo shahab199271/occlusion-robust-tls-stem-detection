@@ -170,7 +170,7 @@ The final TreeQSM-based patch/cylinder filtering and cylinder reconstruction use
 
 ## TreeQSM
 
-For the TreeQSM-dependent steps, use **TreeQSM 2.4.1** from the official repository:
+For the TreeQSM-dependent steps, use **TreeQSM 2.4.0** from the official repository:
 
 https://github.com/InverseTampere/TreeQSM
 
