@@ -20,6 +20,7 @@ The implementation is organised around whole-tree preprocessing and connected su
 | --- | --- |
 | `preprocessing/` | Point-cloud loading, 10D feature construction, fixed k-NN graph construction, TreeQSM label handling, and connected subgraph sampling |
 | `models/` | Fixed-graph EdgeConv, local multi-head attention, PMA pooling, FiLM conditioning, and the stem detector assembly |
+| `training/` | Class-weighted training objective, graph smoothness, AdamW optimisation, validation F2 early stopping, and checkpoint/history output |
 | `occlusion/` | Synthetic occlusion generation for controlled robustness experiments |
 | `inference/` | Exhaustive non-overlapping full-tree inference |
 | `postprocessing/` | High-confidence core selection and two-pass axis-envelope expansion |
@@ -133,6 +134,12 @@ with ReLU activations and dropout.
 
 Model components are exposed through the `models` package so that they can be assembled and tested independently.
 
+## Training
+
+The `training` package follows the supervised training protocol described in the manuscript: class-weighted binary cross-entropy on logits, graph-smoothness regularisation, AdamW with a learning rate of `1e-3` and weight decay of `1e-4`, connected 8,192-point subgraphs, a maximum of 40 epochs, and validation-F2 early stopping with patience 10. The positive-class weight is computed once from the labelled training trees.
+
+The numerical graph-smoothness weight and gradient-clipping threshold are not reported in the manuscript. The repository therefore uses configurable defaults of `0.01` and `1.0`, respectively. Occlusion-aware training accepts the two precomputed occluded variants per training tree and uses a 50/50 clean/occluded sampling probability.
+
 ## Full-tree inference
 
 Inference processes a tree through connected, non-overlapping subgraphs until every point has been covered exactly once. Predictions are returned in the original point order.
@@ -166,7 +173,7 @@ The repository implements the first two geometric post-processing stages:
 
 The envelope uses adaptive vertical bins, median horizontal centres, a 95th-percentile radius constrained to 0.05--0.55 m, nearest-bin propagation, and a 7-bin moving average.
 
-The final TreeQSM-based patch/cylinder filtering and cylinder reconstruction used in the study are part of the TreeQSM workflow and are not duplicated in this repository.
+The final local patch/cylinder filtering stage and the TreeQSM-based cylinder reconstruction used in the study are not duplicated in this repository.
 
 ## TreeQSM
 
